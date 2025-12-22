@@ -1,0 +1,15 @@
+# .github/dependabot.yml
+version: 2
+updates:
+  # 监控npm依赖（可根据项目类型替换，如pip、maven、gradle等）
+  - package-ecosystem: "npm" # 依赖生态系统：npm/pip/maven/gradle/docker等
+    directory: "/" # 依赖文件所在目录（根目录用/）
+    schedule:
+      interval: "daily" # 检查更新的频率：daily/weekly/monthly
+    # 仅针对安全漏洞创建更新PR（关键：与Dependabot alerts联动）
+    security-updates: true
+    # 可选：配置PR的其他规则
+    open-pull-requests-limit: 10 # 最多同时打开10个PR
+    labels:
+      - "dependencies"
+      - "security"
