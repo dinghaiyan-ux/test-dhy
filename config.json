@@ -1,0 +1,16 @@
+{
+  "project_name": "Pokee Automation Test",
+  "version": "1.0.0",
+  "environment": "development",
+  "test_settings": {
+    "timeout": 30,
+    "retries": 3,
+    "verbose_logging": true
+  },
+  "api_endpoints": {
+    "slack": "https://slack.com/api",
+    "github": "https://api.github.com",
+    "gmail": "https://gmail.googleapis.com"
+  },
+  "last_updated": "2026-02-27"
+}
