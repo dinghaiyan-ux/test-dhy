@@ -1,0 +1,14 @@
+name: CI Test for Pokee
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hello World Step
+        run: echo "Hello, Pokee! This is a CI test."
