@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pokee Automation Test - 文档</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --surface: #1a2332;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      margin: 0;
+      padding: 2rem;
+      max-width: 720px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+    }
+    .version {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 2rem;
+    }
+    section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+    section h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 0 0 0.75rem 0;
+      color: var(--accent);
+    }
+    ul {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+    li { margin-bottom: 0.35rem; }
+    code {
+      background: var(--bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .badge {
+      display: inline-block;
+      padding: 0.2em 0.5em;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      background: rgba(63, 185, 80, 0.2);
+      color: var(--success);
+    }
+  </style>
+</head>
+<body>
+  <h1>Pokee Automation Test</h1>
+  <p class="version">版本 1.0.1 · 文档站点</p>
+
+  <section>
+    <h2>项目简介</h2>
+    <p>Pokee Automation Test 是自动化测试与工作流项目，用于集成与验证多种外部 API 与自动化能力。</p>
+  </section>
+
+  <section>
+    <h2>环境与配置</h2>
+    <ul>
+      <li><strong>环境</strong>: Development</li>
+      <li><strong>超时</strong>: 30 秒</li>
+      <li><strong>重试</strong>: 3 次</li>
+      <li><strong>详细日志</strong>: 已开启</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>API 端点</h2>
+    <ul>
+      <li>Slack: <code>https://slack.com/api</code></li>
+      <li>GitHub: <code>https://api.github.com</code></li>
+      <li>Gmail: <code>https://gmail.googleapis.com</code></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>相关链接</h2>
+    <ul>
+      <li><a href="https://github.com">GitHub</a></li>
+      <li>仓库文档由 GitHub Pages 从 <code>/docs</code> 目录发布</li>
+    </ul>
+  </section>
+
+  <p class="version">最后更新: 2026-02-27</p>
+</body>
+</html>
