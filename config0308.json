@@ -1,0 +1,9 @@
+{
+  "project": "test-dhy",
+  "version": "0.3.8",
+  "date": "2026-03-08",
+  "settings": {
+    "debug": false,
+    "environment": "production"
+  }
+}
