@@ -11,3 +11,4 @@ jobs:
           node-version: '20'
       - run: npm install -g bats
       - run: bats -v
+      - run: exit 1  # <--- 加上这一行
