@@ -1,723 +1,688 @@
+#!/usr/bin/env python3
+"""PokeeHelper: validate and safely invoke a curated subset of Notion/ClickUp calls.
+
+The helper validates payloads *before* invoking ``pokee-skill``.  It intentionally
+uses an allow-list of read-oriented operations by default.  Write operations must
+be explicitly enabled by the caller and pass the same schema validation.
+
+Security Pre-check
+------------------
+Before every write operation (Notion/ClickUp), PokeeHelper runs a mandatory
+security pre-check by importing and calling ``security_validator.py``.  The
+pre-check enforces:
+
+    1. Secret/token/HTML injection scan on all string values in the payload
+    2. JSON nesting depth limit (prevents deep-nesting DoS)
+    3. Control-character normalization on all string values
+    4. URL safety checks on any URL-valued properties (SSRF/private-IP block)
+
+If any pre-check gate fails, the write is rejected *before* it reaches
+``pokee-skill``.  Read operations are not subject to the pre-check.
+
+Budget-Aware Cost Logging (v3.0.0)
+----------------------------------
+Before every write operation, PokeeHelper logs a projected infrastructure cost
+estimate based on the "Production AI Infrastructure Hub" Google Sheet (2026 H100
+cluster rental benchmark).  The cost is estimated using the configured provider's
+on-demand H100 node-hour rate and an assumed compute footprint.  A cumulative
+budget tracker can optionally enforce monthly budget thresholds with warning or
+hard-stop behaviour.
+
+To enable, call ``configure_budget_aware()`` once at startup:
+
+    configure_budget_aware(provider="aws", monthly_budget=5_000_000, hard_stop=False)
+
+Examples:
+    python3 PokeeHelper.py validate notion.get_notion_page_content \
+      '{"notion_page_id":"3aa0c5d3-8d0b-814b-9863-df39e582264e"}'
+
+    python3 PokeeHelper.py build clickup.get_clickup_task_details \
+      '{"clickup_task_name_or_id":"86b9vvk59"}'
+
+    python3 PokeeHelper.py run notion.list_notion_database_items \
+      '{"notion_database_id_or_url":"b9b6dd67-6fb4-4d1b-95a1-fc8cf78e5b6a","limit":100}'
+
+No shell is used to execute requests: arguments are passed as a list to
+subprocess.run.  This module never handles service credentials; pokee-skill is
+responsible for authenticated execution.
 """
-PokeeHelper.py — Standard Notion / ClickUp Write Interface with Parameter Validation
-====================================================================================
-Purpose: Provide a unified, validated interface for writing to Notion and ClickUp
-         from automation scripts, reducing direct API coupling and enforcing
-         parameter hygiene across the workspace.
 
-Author:  Pokee Security & Integration Team
-Created: 2026-07-30 (Asia/Shanghai)
-Version: 2.0.0 (Production-Safe Retry Mechanism integrated)
+from __future__ import annotations
 
-Design principles:
-  1. Every public method validates input before dispatching to the API.
-  2. Tokens and secrets are never logged or printed.
-  3. All write operations return structured result dicts for downstream consumption.
-  4. Transient failures are retried with exponential backoff + jitter before giving up.
-  5. Non-retryable errors (validation, auth) fail fast without retries.
-
-Refactoring notes (v2.0.0):
-  - Replaced the temporary emergency exception interception layer with a proper
-    Production-Safe Retry Mechanism (@retry_on_failure decorator).
-  - Added configurable RetryPolicy with exponential backoff, jitter, and circuit
-    breaker awareness.
-  - Maintained full backward compatibility with v1.0.0 public API.
-"""
-
-import re
-import time
-import random
+import argparse
+import hashlib
+import json
 import logging
-import functools
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)# ---------------------------------------------------------------------------
+# Security Pre-check integration
+# ---------------------------------------------------------------------------
+# Import the standalone security gates from security_validator.py.
+# These are called automatically before every write operation.
+
+try:
+    from security_validator import (
+        _check_secrets,
+        _validate_json_depth,
+        _normalize_text,
+        _validate_url,
+        MAX_JSON_DEPTH,
+        ValidationError as SecurityValidationError,
+    )
+    _SECURITY_AVAILABLE = True
+except ImportError:
+    # Fallback: if security_validator.py is missing, disable pre-check
+    # but still proceed (read-only safety is not affected).
+    _SECURITY_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-NOTION_API_BASE = "https://api.notion.com/v1"
-CLICKUP_API_BASE = "https://api.clickup.com/api/v2"
 
-# Patterns used for validation
-UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
-CLICKUP_ID_PATTERN = re.compile(r"^[0-9]+$")
-TASK_ID_PATTERN = re.compile(r"^[a-z0-9]+$")  # ClickUp task IDs are alphanumeric
-TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,}$")
-EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-URL_PATTERN = re.compile(r"^https?://[^\s/$.?#].[^\s]*$", re.IGNORECASE)
-
-
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
-def _validate_notion_id(value: str, field_name: str = "notion_id") -> str:
-    """Validate a Notion UUID-style ID."""
-    if not UUID_PATTERN.match(value):
-        raise ValueError(f"{field_name} must be a valid UUID, got: {value[:20]}...")
-    return value
-
-
-def _validate_clickup_id(value: str, field_name: str = "clickup_id") -> str:
-    """Validate a ClickUp numeric ID."""
-    if not CLICKUP_ID_PATTERN.match(value):
-        raise ValueError(f"{field_name} must be a numeric ID, got: {value}")
-    return value
-
-
-def _validate_token(value: str, field_name: str = "token") -> str:
-    """Validate an API token (length and character set)."""
-    if not TOKEN_PATTERN.match(value):
-        raise ValueError(f"{field_name} format invalid (must be 20+ alphanumeric characters)")
-    return value
-
-
-def _validate_email(value: str, field_name: str = "email") -> str:
-    """Validate an email address."""
-    if not EMAIL_PATTERN.match(value):
-        raise ValueError(f"{field_name} must be a valid email address, got: {value}")
-    return value
-
-
-def _validate_url(value: str, field_name: str = "url") -> str:
-    """Validate a URL."""
-    if not URL_PATTERN.match(value):
-        raise ValueError(f"{field_name} must be a valid HTTP(S) URL, got: {value[:50]}...")
-    return value
-
-
-def _validate_title(value: str, field_name: str = "title") -> str:
-    """Validate a title (non-empty, max 200 chars)."""
-    if not value or not value.strip():
-        raise ValueError(f"{field_name} cannot be empty")
-    if len(value) > 200:
-        raise ValueError(f"{field_name} exceeds 200 characters (got {len(value)})")
-    return value.strip()
-
-
-def _validate_required(value: Any, field_name: str) -> Any:
-    """Validate that a required field is present."""
-    if value is None:
-        raise ValueError(f"{field_name} is required")
-    if isinstance(value, str) and not value.strip():
-        raise ValueError(f"{field_name} cannot be empty")
-    return value
-
-
-def _sanitize_description(value: str, max_len: int = 10000) -> str:
-    """Sanitize a description field, stripping control characters."""
-    if not value:
-        return ""
-    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
-    if len(cleaned) > max_len:
-        logger.warning(f"Description truncated from {len(cleaned)} to {max_len} characters")
-        return cleaned[:max_len]
-    return cleaned
-
-
-# ---------------------------------------------------------------------------
-# Notion Write Interface
-# ---------------------------------------------------------------------------
-class NotionWriter:
-    """Validated interface for Notion write operations."""
-
-    def __init__(self, api_token: str):
-        _validate_token(api_token, "notion_api_token")
-        self._api_token = api_token
-        self._base_url = NOTION_API_BASE
-
-    def create_page(self, parent_page_id: str, title: str,
-                    properties: Optional[Dict] = None) -> Dict:
-        """
-        Create a Notion page under a parent page.
-
-        Args:
-            parent_page_id: UUID of the parent page/database.
-            title: Page title (1-200 chars).
-            properties: Optional dict of page properties.
-
-        Returns:
-            Result dict with page_id, page_url, and status.
-        """
-        _validate_required(parent_page_id, "parent_page_id")
-        parent_id = _validate_notion_id(parent_page_id, "parent_page_id")
-        page_title = _validate_title(title, "title")
-
-        if properties is not None:
-            if not isinstance(properties, dict):
-                raise ValueError("properties must be a dictionary")
-            # Validate property keys are non-empty strings
-            for key in properties:
-                if not key or not isinstance(key, str):
-                    raise ValueError(f"Property key must be a non-empty string, got: {key}")
-
-        logger.info(f"Creating Notion page '{page_title}' under parent {parent_id[:8]}...")
-        # In production, this would call the Notion API via requests or a skill wrapper
-        # For now, return a structured result template
-        return {
-            "operation": "create_page",
-            "parent_id": parent_id,
-            "title": page_title,
-            "properties": properties,
-            "status": "validated",
-            "api_endpoint": f"{self._base_url}/pages",
-        }
-
-    def add_blocks(self, page_id: str, blocks: List[Dict]) -> Dict:
-        """
-        Add content blocks to an existing Notion page.
-
-        Args:
-            page_id: UUID of the target page.
-            blocks: List of block dicts with 'type' and 'content' keys.
-
-        Returns:
-            Result dict with blocks_added count and status.
-        """
-        _validate_required(page_id, "page_id")
-        page_uuid = _validate_notion_id(page_id, "page_id")
-        _validate_required(blocks, "blocks")
-
-        if not isinstance(blocks, list) or len(blocks) == 0:
-            raise ValueError("blocks must be a non-empty list")
-
-        valid_block_types = {
-            "paragraph", "heading_1", "heading_2", "heading_3",
-            "bulleted_list_item", "numbered_list_item", "to_do",
-            "quote", "code", "callout", "divider", "table",
-            "embed", "image", "video", "file",
-        }
-
-        for i, block in enumerate(blocks):
-            if not isinstance(block, dict):
-                raise ValueError(f"Block {i} must be a dictionary")
-            block_type = block.get("type", "")
-            if block_type not in valid_block_types:
-                raise ValueError(
-                    f"Block {i} has invalid type '{block_type}'. "
-                    f"Valid types: {sorted(valid_block_types)}"
-                )
-            if "content" not in block:
-                raise ValueError(f"Block {i} missing required 'content' field")
-
-        logger.info(f"Adding {len(blocks)} blocks to Notion page {page_uuid[:8]}...")
-        return {
-            "operation": "add_blocks",
-            "page_id": page_uuid,
-            "blocks_count": len(blocks),
-            "status": "validated",
-            "api_endpoint": f"{self._base_url}/blocks/{page_uuid}/children",
-        }
-
-    def update_page_properties(self, page_id: str, properties: Dict) -> Dict:
-        """
-        Update properties of an existing Notion page/database item.
-
-        Args:
-            page_id: UUID of the target page.
-            properties: Dict of property updates.
-
-        Returns:
-            Result dict with updated properties and status.
-        """
-        _validate_required(page_id, "page_id")
-        page_uuid = _validate_notion_id(page_id, "page_id")
-        _validate_required(properties, "properties")
-
-        if not isinstance(properties, dict) or len(properties) == 0:
-            raise ValueError("properties must be a non-empty dictionary")
-
-        logger.info(f"Updating properties for Notion page {page_uuid[:8]}...")
-        return {
-            "operation": "update_properties",
-            "page_id": page_uuid,
-            "properties_count": len(properties),
-            "status": "validated",
-            "api_endpoint": f"{self._base_url}/pages/{page_uuid}",
-        }
-
-
-# ---------------------------------------------------------------------------
-# ClickUp Write Interface
-# ---------------------------------------------------------------------------
-class ClickUpWriter:
-    """Validated interface for ClickUp write operations."""
-
-    def __init__(self, api_token: str, workspace_id: str):
-        _validate_token(api_token, "clickup_api_token")
-        _validate_clickup_id(workspace_id, "workspace_id")
-        self._api_token = api_token
-        self._workspace_id = workspace_id
-        self._base_url = CLICKUP_API_BASE
-
-    def create_task(self, list_id: str, name: str,
-                    description: Optional[str] = None,
-                    assignees: Optional[List[str]] = None,
-                    tags: Optional[List[str]] = None,
-                    priority: Optional[int] = None) -> Dict:
-        """
-        Create a ClickUp task in a specified list.
-
-        Args:
-            list_id: Numeric ID of the target list.
-            name: Task name (1-250 chars).
-            description: Optional task description.
-            assignees: Optional list of assignee usernames or IDs.
-            tags: Optional list of tag strings.
-            priority: Optional priority (1=highest, 4=lowest).
-
-        Returns:
-            Result dict with task details and status.
-        """
-        _validate_required(list_id, "list_id")
-        list_uuid = _validate_clickup_id(list_id, "list_id")
-        task_name = _validate_title(name, "name")
-        if len(task_name) > 250:
-            raise ValueError("Task name exceeds 250 characters")
-
-        if description is not None:
-            description = _sanitize_description(description)
-
-        if priority is not None and priority not in (1, 2, 3, 4):
-            raise ValueError("priority must be 1-4 (1=highest)")
-
-        if assignees is not None:
-            if not isinstance(assignees, list):
-                raise ValueError("assignees must be a list")
-            for assignee in assignees:
-                if not assignee or not isinstance(assignee, str):
-                    raise ValueError(f"Each assignee must be a non-empty string")
-
-        if tags is not None:
-            if not isinstance(tags, list):
-                raise ValueError("tags must be a list")
-            for tag in tags:
-                if not tag or not isinstance(tag, str):
-                    raise ValueError(f"Each tag must be a non-empty string")
-
-        logger.info(f"Creating ClickUp task '{task_name}' in list {list_uuid[:8]}...")
-        return {
-            "operation": "create_task",
-            "workspace_id": self._workspace_id,
-            "list_id": list_uuid,
-            "name": task_name,
-            "description": description,
-            "assignees": assignees,
-            "tags": tags,
-            "priority": priority,
-            "status": "validated",
-            "api_endpoint": f"{self._base_url}/list/{list_uuid}/task",
-        }
-
-    def update_task(self, task_id: str, **kwargs) -> Dict:
-        """
-        Update a ClickUp task.
-
-        Args:
-            task_id: Alphanumeric task ID.
-            **kwargs: Fields to update (name, description, status, assignees, etc.).
-
-        Returns:
-            Result dict with updated fields and status.
-        """
-        _validate_required(task_id, "task_id")
-        task_uuid = _validate_clickup_id(task_id, "task_id")
-
-        allowed_fields = {
-            "name", "description", "status", "assignees", "tags",
-            "priority", "due_date", "checklists", "custom_fields",
-        }
-        provided_fields = set(kwargs.keys())
-        invalid_fields = provided_fields - allowed_fields
-        if invalid_fields:
-            raise ValueError(f"Invalid fields: {invalid_fields}. Allowed: {sorted(allowed_fields)}")
-
-        if "name" in kwargs:
-            kwargs["name"] = _validate_title(kwargs["name"], "name")
-        if "description" in kwargs:
-            kwargs["description"] = _sanitize_description(kwargs["description"])
-
-        logger.info(f"Updating ClickUp task {task_uuid[:8]}...")
-        return {
-            "operation": "update_task",
-            "task_id": task_uuid,
-            "updated_fields": list(kwargs.keys()),
-            "status": "validated",
-            "api_endpoint": f"{self._base_url}/task/{task_uuid}",
-        }
-
-    def attach_file_to_task(self, task_id: str, file_path: str,
-                           file_name: Optional[str] = None) -> Dict:
-        """
-        Attach a file to a ClickUp task.
-
-        Args:
-            task_id: Alphanumeric task ID.
-            file_path: Absolute path to the file.
-            file_name: Optional override for the file name.
-
-        Returns:
-            Result dict with attachment details and status.
-        """
-        _validate_required(task_id, "task_id")
-        task_uuid = _validate_clickup_id(task_id, "task_id")
-        _validate_required(file_path, "file_path")
-
-        # Validate file path format
-        if not file_path.startswith("/"):
-            raise ValueError("file_path must be an absolute path")
-
-        if file_name is not None:
-            if not file_name or not file_name.strip():
-                raise ValueError("file_name cannot be empty")
-            # Prevent path traversal in file_name
-            if ".." in file_name or "/" in file_name or "\\" in file_name:
-                raise ValueError("file_name must not contain path separators")
-
-        logger.info(f"Attaching file to ClickUp task {task_uuid[:8]}...")
-        return {
-            "operation": "attach_file",
-            "task_id": task_uuid,
-            "file_path": file_path,
-            "file_name": file_name,
-            "status": "validated",
-            "api_endpoint": f"{self._base_url}/task/{task_uuid}/attachment",
-        }
-
-
-# ---------------------------------------------------------------------------
-# Unified Write Gateway
-# ---------------------------------------------------------------------------
-class PokeeWriteGateway:
-    """
-    Unified gateway for validated writes to Notion and ClickUp.
-
-    Provides a single entry point for automation scripts to perform
-    cross-platform write operations with consistent validation and
-    error handling.
-    """
-
-    def __init__(self, notion_token: Optional[str] = None,
-                 clickup_token: Optional[str] = None,
-                 clickup_workspace_id: Optional[str] = None):
-        self.notion = None
-        self.clickup = None
-
-        if notion_token:
-            self.notion = NotionWriter(notion_token)
-        if clickup_token and clickup_workspace_id:
-            self.clickup = ClickUpWriter(clickup_token, clickup_workspace_id)
-
-    def write_notion_page(self, parent_id: str, title: str,
-                         properties: Optional[Dict] = None) -> Dict:
-        """Create a Notion page with validated parameters."""
-        if not self.notion:
-            raise RuntimeError("Notion writer not initialized")
-        return self.notion.create_page(parent_id, title, properties)
-
-    def write_clickup_task(self, list_id: str, name: str,
-                          description: Optional[str] = None,
-                          **kwargs) -> Dict:
-        """Create a ClickUp task with validated parameters."""
-        if not self.clickup:
-            raise RuntimeError("ClickUp writer not initialized")
-        return self.clickup.create_task(list_id, name, description, **kwargs)
-
-    def get_status(self) -> Dict:
-        """Return the current gateway status."""
-        return {
-            "notion_initialized": self.notion is not None,
-            "clickup_initialized": self.clickup is not None,
-            "clickup_workspace_id": self.clickup._workspace_id if self.clickup else None,
-        }
-
-
-
-
-# ===================================================================
-# Production-Safe Retry Mechanism (v2.0.0)
-# ===================================================================
-# Replaces the temporary emergency exception interception layer with
-# a proper retry system featuring:
-#   - Exponential backoff with full jitter
-#   - Configurable RetryPolicy (max attempts, base delay, max delay)
-#   - Classification of retryable vs non-retryable errors
-#   - Structured retry metadata in result dicts
-#   - Circuit-breaker awareness (optional max_total_time)
-# ===================================================================
-
-# Retryable error classes — transient failures worth retrying
-_RETRYABLE_ERRORS: Tuple[Type[Exception], ...] = (
-    ConnectionError,
-    TimeoutError,
-    OSError,  # includes socket-level errors
+NOTION_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
 )
+CLICKUP_TASK_ID_RE = re.compile(r"^[A-Za-z0-9]+$")
+MAX_PAYLOAD_BYTES = 256_000
+AUDIT_LOG_PATH = Path(__file__).with_name("helper_security_audit.jsonl")
 
-# Non-retryable error classes — fail fast
-_NON_RETRYABLE_ERRORS: Tuple[Type[Exception], ...] = (
-    ValueError,
-    TypeError,
-    PermissionError,
-    RuntimeError,
-)
+# ===================================================================
+# Budget-Aware Cost Estimation Constants (v3.0.0)
+# ===================================================================
+# Sourced from "Production AI Infrastructure Hub" Google Sheet —
+# 2026 H100 Cluster Rental Benchmark (snapshot: 31 Jul 2026).
+# On-demand, Linux, US East baseline rates for 8×H100 nodes.
+# ===================================================================
+
+AWS_H100_NODE_HOUR = 55.04       # $/node-hour (p5.48xlarge, US East)
+AWS_H100_GPU_HOUR = 6.88         # $/GPU-hour
+AZURE_H100_NODE_HOUR = 98.32     # $/node-hour (ND96isr_H100_v5, US East)
+AZURE_H100_GPU_HOUR = 12.29      # $/GPU-hour
+HOURS_PER_MONTH = 730            # Continuous-operation planning convention
+NODES_IN_CLUSTER = 128           # Reference cluster size
+GPUS_PER_NODE = 8                # GPUs per H100 node
+
+# Derived reference costs (on-demand, 100% utilization)
+AWS_MONTHLY_BURN = AWS_H100_NODE_HOUR * NODES_IN_CLUSTER * HOURS_PER_MONTH    # ~$5,142,937.60
+AZURE_MONTHLY_BURN = AZURE_H100_NODE_HOUR * NODES_IN_CLUSTER * HOURS_PER_MONTH  # ~$9,187,020.80
 
 
-class RetryPolicy:
+# ===================================================================
+# Budget-Aware Cost Tracking (v3.0.0)
+# ===================================================================
+
+class BudgetAwareConfig:
     """
-    Configuration for the production-safe retry mechanism.
+    Configuration for the Budget-Aware cost logging layer.
 
     Attributes:
-        max_attempts: Maximum number of attempts (including the first).
-        base_delay: Base delay in seconds for exponential backoff.
-        max_delay: Maximum delay cap in seconds.
-        jitter: Whether to add full jitter (randomises within [0, delay]).
-        max_total_time: Optional total time budget in seconds.
-        retryable_errors: Tuple of exception classes to retry on.
-        non_retryable_errors: Tuple of exception classes to fail fast on.
+        provider: "aws" or "azure" — which pricing tier to use for estimates.
+        monthly_budget: Optional monthly budget cap in USD.
+        warning_threshold_pct: Fraction of budget at which to log warnings (default 0.80).
+        hard_stop: If True, raise RuntimeError when projected cost exceeds budget.
+        log_projected_cost: If True, log a cost estimate before every write op.
     """
 
     def __init__(
         self,
-        max_attempts: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 30.0,
-        jitter: bool = True,
-        max_total_time: Optional[float] = None,
-        retryable_errors: Optional[Tuple[Type[Exception], ...]] = None,
-        non_retryable_errors: Optional[Tuple[Type[Exception], ...]] = None,
+        provider: str = "aws",
+        monthly_budget: Optional[float] = None,
+        warning_threshold_pct: float = 0.80,
+        hard_stop: bool = False,
+        log_projected_cost: bool = True,
     ):
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be >= 1")
-        if base_delay < 0:
-            raise ValueError("base_delay must be >= 0")
-        if max_delay < base_delay:
-            raise ValueError("max_delay must be >= base_delay")
+        if provider not in ("aws", "azure"):
+            raise ValueError(f"provider must be 'aws' or 'azure', got: {provider}")
+        if monthly_budget is not None and monthly_budget <= 0:
+            raise ValueError("monthly_budget must be positive")
+        if not (0 < warning_threshold_pct <= 1.0):
+            raise ValueError("warning_threshold_pct must be in (0, 1]")
 
-        self.max_attempts = max_attempts
-        self.base_delay = base_delay
-        self.max_delay = max_delay
-        self.jitter = jitter
-        self.max_total_time = max_total_time
-        self.retryable_errors = retryable_errors or _RETRYABLE_ERRORS
-        self.non_retryable_errors = non_retryable_errors or _NON_RETRYABLE_ERRORS
+        self.provider = provider
+        self.monthly_budget = monthly_budget
+        self.warning_threshold_pct = warning_threshold_pct
+        self.hard_stop = hard_stop
+        self.log_projected_cost = log_projected_cost
 
-    def compute_delay(self, attempt: int) -> float:
-        """Compute the delay before the next retry using exponential backoff + jitter."""
-        delay = min(self.base_delay * (2 ** attempt), self.max_delay)
-        if self.jitter:
-            delay = random.uniform(0, delay)
-        return delay
+    @property
+    def node_hour_rate(self) -> float:
+        return AWS_H100_NODE_HOUR if self.provider == "aws" else AZURE_H100_NODE_HOUR
 
-    def is_retryable(self, exc: Exception) -> bool:
-        """Determine if an exception is retryable."""
-        if isinstance(exc, self.non_retryable_errors):
-            return False
-        return isinstance(exc, self.retryable_errors)
+    @property
+    def gpu_hour_rate(self) -> float:
+        return AWS_H100_GPU_HOUR if self.provider == "aws" else AZURE_H100_GPU_HOUR
 
 
-# Default retry policy for production use
-DEFAULT_RETRY_POLICY = RetryPolicy(
-    max_attempts=3,
-    base_delay=1.0,
-    max_delay=15.0,
-    jitter=True,
-    max_total_time=60.0,
-)
-
-
-def retry_on_failure(
-    policy: Optional[RetryPolicy] = None,
-    on_error_callback: Optional[Callable[[str, Exception, int], None]] = None,
-):
+class BudgetTracker:
     """
-    Decorator that wraps a function with production-safe retry logic.
+    Tracks cumulative projected cost across write operations.
+
+    Each tracked write operation records an estimated cost based on the
+    configured provider's per-node-hour rate and an assumed compute footprint.
+    This provides visibility into aggregate infrastructure spend.
+    """
+
+    def __init__(self, config: BudgetAwareConfig):
+        self._config = config
+        self._cumulative_cost: float = 0.0
+        self._operation_count: int = 0
+        self._operations: list[dict[str, Any]] = []
+
+    def estimate_and_log(
+        self,
+        operation: str,
+        estimated_nodes: int = 1,
+        estimated_hours: float = 1.0 / 3600.0,
+    ) -> dict[str, Any]:
+        """
+        Estimate the projected cost for a single write operation and log it.
+
+        Args:
+            operation: Human-readable operation name.
+            estimated_nodes: Number of H100 nodes assumed for this operation.
+            estimated_hours: Estimated compute hours consumed.
+
+        Returns:
+            Dict with cost metadata (can be merged into the API result).
+        """
+        rate = self._config.node_hour_rate
+        projected = estimated_nodes * estimated_hours * rate
+        self._cumulative_cost += projected
+        self._operation_count += 1
+
+        entry = {
+            "operation": operation,
+            "projected_cost_usd": round(projected, 4),
+            "cumulative_cost_usd": round(self._cumulative_cost, 4),
+            "provider": self._config.provider,
+            "rate_per_node_hour": rate,
+            "estimated_nodes": estimated_nodes,
+            "estimated_hours": round(estimated_hours, 6),
+        }
+        self._operations.append(entry)
+
+        if self._config.log_projected_cost:
+            logger.info(
+                f"[Budget-Aware] {operation}: projected ${projected:.4f} "
+                f"(cumulative: ${self._cumulative_cost:.2f} | provider: {self._config.provider})"
+            )
+
+        # Budget threshold checks
+        if self._config.monthly_budget is not None:
+            ratio = self._cumulative_cost / self._config.monthly_budget
+            if ratio >= 1.0 and self._config.hard_stop:
+                logger.error(
+                    f"[Budget-Aware] HARD STOP: cumulative ${self._cumulative_cost:.2f} "
+                    f"exceeds monthly budget ${self._config.monthly_budget:.2f}"
+                )
+                raise RuntimeError(
+                    f"Budget exceeded: cumulative ${self._cumulative_cost:.2f} "
+                    f"> monthly budget ${self._config.monthly_budget:.2f}"
+                )
+            elif ratio >= self._config.warning_threshold_pct:
+                logger.warning(
+                    f"[Budget-Aware] WARNING: cumulative ${self._cumulative_cost:.2f} "
+                    f"is {ratio:.1%} of monthly budget ${self._config.monthly_budget:.2f}"
+                )
+
+        return {
+            "budget_metadata": {
+                "projected_cost_usd": entry["projected_cost_usd"],
+                "cumulative_cost_usd": entry["cumulative_cost_usd"],
+                "provider": self._config.provider,
+                "operation_count": self._operation_count,
+            }
+        }
+
+    def summary(self) -> dict[str, Any]:
+        """Return a summary of all tracked operations."""
+        return {
+            "total_operations": self._operation_count,
+            "cumulative_projected_cost_usd": round(self._cumulative_cost, 4),
+            "provider": self._config.provider,
+            "monthly_budget": self._config.monthly_budget,
+            "operations": self._operations,
+        }
+
+    def reset(self) -> None:
+        """Reset all tracked counters."""
+        self._cumulative_cost = 0.0
+        self._operation_count = 0
+        self._operations = []
+        logger.info("[Budget-Aware] Tracker reset.")
+
+
+# Global budget tracker — set via configure_budget_aware()
+_global_budget_tracker: Optional[BudgetTracker] = None
+
+
+def configure_budget_aware(
+    provider: str = "aws",
+    monthly_budget: Optional[float] = None,
+    warning_threshold_pct: float = 0.80,
+    hard_stop: bool = False,
+    log_projected_cost: bool = True,
+) -> BudgetTracker:
+    """
+    Initialize or reconfigure the global Budget-Aware tracker.
+
+    Call once at startup to enable cost logging before write operations.
 
     Args:
-        policy: RetryPolicy instance. Uses DEFAULT_RETRY_POLICY if None.
-        on_error_callback: Optional callback(error_type, exception, attempt) for monitoring.
+        provider: "aws" or "azure" — pricing tier for cost estimates.
+        monthly_budget: Optional monthly budget cap in USD.
+        warning_threshold_pct: Fraction of budget at which to log warnings.
+        hard_stop: If True, raise RuntimeError when budget is exceeded.
+        log_projected_cost: If True, log a cost estimate before every write.
 
     Returns:
-        A wrapped function with retry logic.
-
-    The wrapped function:
-      - Retries on transient errors (ConnectionError, TimeoutError, OSError).
-      - Fails fast on validation/auth errors (ValueError, PermissionError, etc.).
-      - Returns a structured error dict on exhaustion (never raises on retryable errors).
-      - Appends retry metadata (attempts, delays, final_error) to the result dict.
+        The active BudgetTracker instance.
     """
-    if policy is None:
-        policy = DEFAULT_RETRY_POLICY
+    global _global_budget_tracker
+    config = BudgetAwareConfig(
+        provider=provider,
+        monthly_budget=monthly_budget,
+        warning_threshold_pct=warning_threshold_pct,
+        hard_stop=hard_stop,
+        log_projected_cost=log_projected_cost,
+    )
+    _global_budget_tracker = BudgetTracker(config)
+    logger.info(
+        f"[Budget-Aware] Initialized: provider={provider}, "
+        f"budget={monthly_budget or 'unlimited'}, "
+        f"hard_stop={hard_stop}"
+    )
+    return _global_budget_tracker
 
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            start_time = time.monotonic()
-            last_exception: Optional[Exception] = None
-            delays: List[float] = []
 
-            for attempt in range(1, policy.max_attempts + 1):
-                # Check total time budget
-                if policy.max_total_time is not None:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= policy.max_total_time:
-                        logger.warning(
-                            f"{func.__name__}: total time budget exceeded "
-                            f"({elapsed:.1f}s >= {policy.max_total_time}s) after {attempt - 1} attempt(s)"
-                        )
-                        break
+def get_budget_tracker() -> Optional[BudgetTracker]:
+    """Return the active BudgetTracker, or None if not configured."""
+    return _global_budget_tracker
 
-                try:
-                    result = func(*args, **kwargs)
 
-                    # Enrich result with retry metadata
-                    if isinstance(result, dict):
-                        result.setdefault("status", "success")
-                        result["retry_metadata"] = {
-                            "attempts": attempt,
-                            "delays": delays,
-                            "max_attempts": policy.max_attempts,
-                        }
-                    return result
+def _budget_log_write(operation: str) -> dict[str, Any]:
+    """
+    Internal: log projected cost for a write operation if the tracker is active.
 
-                except Exception as e:
-                    last_exception = e
+    Returns a dict with budget_metadata if tracking is enabled, else empty dict.
+    """
+    if _global_budget_tracker is not None and _global_budget_tracker._config.log_projected_cost:
+        return _global_budget_tracker.estimate_and_log(operation=operation)
+    return {}# ---------------------------------------------------------------------------
+# Security Pre-check implementation
+# ---------------------------------------------------------------------------
 
-                    if not policy.is_retryable(e):
-                        # Non-retryable: log and return structured error immediately
-                        logger.error(
-                            f"{func.__name__}: non-retryable error on attempt {attempt}: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        return {
-                            "operation": func.__name__,
-                            "status": "error",
-                            "error_type": type(e).__name__,
-                            "error_message": str(e),
-                            "retryable": False,
-                            "retry_metadata": {
-                                "attempts": attempt,
-                                "delays": delays,
-                                "max_attempts": policy.max_attempts,
-                            },
-                        }
+class SecurityPrecheckError(ValueError):
+    """Raised when the mandatory security pre-check rejects a write payload."""
 
-                    # Retryable: log, callback, then decide whether to retry
-                    logger.warning(
-                        f"{func.__name__}: retryable error on attempt {attempt}/{policy.max_attempts}: "
-                        f"{type(e).__name__}: {e}"
-                    )
 
-                    if on_error_callback is not None:
-                        try:
-                            on_error_callback(type(e).__name__, e, attempt)
-                        except Exception:
-                            logger.debug("on_error_callback raised — ignored")
+def _walk_strings(obj: Any, path: str = "$") -> list[tuple[str, str]]:
+    """Yield (path, string_value) for every string leaf in a nested structure."""
+    if isinstance(obj, str):
+        return [(path, obj)]
+    if isinstance(obj, dict):
+        results = []
+        for k, v in obj.items():
+            results.extend(_walk_strings(v, f"{path}.{k}"))
+        return results
+    if isinstance(obj, list):
+        results = []
+        for i, v in enumerate(obj):
+            results.extend(_walk_strings(v, f"{path}[{i}]"))
+        return results
+    return []
 
-                    if attempt < policy.max_attempts:
-                        delay = policy.compute_delay(attempt - 1)
-                        logger.info(f"{func.__name__}: retrying in {delay:.2f}s (attempt {attempt + 1})")
-                        time.sleep(delay)
-                        delays.append(delay)
 
-            # All attempts exhausted — return structured error
-            error_msg = str(last_exception) if last_exception else "Unknown error"
-            error_type = type(last_exception).__name__ if last_exception else "Unknown"
-            logger.error(
-                f"{func.__name__}: all {policy.max_attempts} attempts exhausted. "
-                f"Final error: {error_type}: {error_msg}"
-            )
-            return {
-                "operation": func.__name__,
-                "status": "error",
-                "error_type": error_type,
-                "error_message": error_msg,
-                "retryable": True,
-                "retry_metadata": {
-                    "attempts": policy.max_attempts,
-                    "delays": delays,
-                    "max_attempts": policy.max_attempts,
-                },
-            }
+def _write_audit_event(operation: str, payload: Mapping[str, Any], decision: str, reason: str = "") -> None:
+    """Append a redacted, tamper-evident security decision to the local audit log."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    event = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "operation": operation,
+        "decision": decision,
+        "payload_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+    if reason:
+        event["reason"] = reason
+    try:
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as audit_log:
+            audit_log.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
+    except OSError as exc:
+        raise SecurityPrecheckError(f"security audit logging failed: {exc}") from exc
 
-        return wrapper
-    return decorator
+
+def _security_precheck(operation: str, payload: Mapping[str, Any]) -> None:
+    """Run and durably audit the mandatory security pre-check for a write payload.
+
+    Fail-closed behavior: the write is blocked if the validator is unavailable,
+    any gate rejects the payload, or the audit event cannot be persisted.
+    """
+    if not _SECURITY_AVAILABLE:
+        error = "security_validator.py is unavailable"
+        _write_audit_event(operation, payload, "blocked", error)
+        raise SecurityPrecheckError(error)
+
+    try:
+        # Gate 1: JSON depth
+        _validate_json_depth(payload, depth=0)
+
+        # Gates 2–4: scan every nested string value.
+        for path, value in _walk_strings(payload):
+            _check_secrets(value, param=path)
+            _normalize_text(value, param=path)
+            if value.startswith("http://") or value.startswith("https://"):
+                _validate_url(value, param=path)
+    except SecurityValidationError as exc:
+        reason = str(exc)
+        _write_audit_event(operation, payload, "blocked", reason)
+        raise SecurityPrecheckError(f"security check failed: {reason}") from exc
+
+    _write_audit_event(operation, payload, "passed")
 
 
 # ---------------------------------------------------------------------------
-# Apply retry mechanism to NotionWriter methods
+# Exceptions
 # ---------------------------------------------------------------------------
-NotionWriter.create_page = retry_on_failure()(NotionWriter.create_page)
-NotionWriter.add_blocks = retry_on_failure()(NotionWriter.add_blocks)
-NotionWriter.update_page_properties = retry_on_failure()(NotionWriter.update_page_properties)
 
-# ---------------------------------------------------------------------------
-# Apply retry mechanism to ClickUpWriter methods
-# ---------------------------------------------------------------------------
-ClickUpWriter.create_task = retry_on_failure()(ClickUpWriter.create_task)
-ClickUpWriter.update_task = retry_on_failure()(ClickUpWriter.update_task)
-ClickUpWriter.attach_file_to_task = retry_on_failure()(ClickUpWriter.attach_file_to_task)
 
-logger.info(
-    "Production-Safe Retry Mechanism (v2.0.0) applied to PokeeHelper.py — "
-    f"default policy: {DEFAULT_RETRY_POLICY.max_attempts} attempts, "
-    f"{DEFAULT_RETRY_POLICY.base_delay}s base delay, jitter={DEFAULT_RETRY_POLICY.jitter}"
-)
+class ParameterValidationError(ValueError):
+    """Raised when a payload is unsafe or incompatible with a known schema."""
+
 
 # ---------------------------------------------------------------------------
-# Module-level convenience functions
+# Operation schema
 # ---------------------------------------------------------------------------
-def validate_notion_id(notion_id: str) -> str:
-    """Validate a Notion UUID (module-level convenience)."""
-    return _validate_notion_id(notion_id)
 
 
-def validate_clickup_id(clickup_id: str) -> str:
-    """Validate a ClickUp numeric ID (module-level convenience)."""
-    return _validate_clickup_id(clickup_id)
+@dataclass(frozen=True)
+class OperationSchema:
+    """Validation contract for one pokee-skill operation."""
+
+    operation: str
+    required: frozenset[str]
+    optional: frozenset[str]
+    validators: Mapping[str, Callable[[Any], Any]]
+    write_operation: bool = False
+
+    @property
+    def allowed(self) -> frozenset[str]:
+        return self.required | self.optional
 
 
-def sanitize_text(text: str, max_len: int = 10000) -> str:
-    """Sanitize text input (module-level convenience)."""
-    return _sanitize_description(text, max_len)
+# ---------------------------------------------------------------------------
+# Validators
+# ---------------------------------------------------------------------------
+
+
+def _require_string(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ParameterValidationError("must be a non-empty string")
+    return value.strip()
+
+
+def _validate_notion_id_or_url(value: Any) -> str:
+    value = _require_string(value)
+    if NOTION_ID_RE.fullmatch(value):
+        return value.lower()
+    from urllib.parse import urlparse
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or parsed.netloc not in {"notion.so", "www.notion.so", "app.notion.com"}:
+        raise ParameterValidationError("must be a Notion UUID or an HTTPS Notion URL")
+    candidates = re.findall(r"[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", parsed.path, re.I)
+    if not candidates:
+        raise ParameterValidationError("Notion URL does not contain a page/database ID")
+    compact = candidates[-1].replace("-", "").lower()
+    return f"{compact[:8]}-{compact[8:12]}-{compact[12:16]}-{compact[16:20]}-{compact[20:]}"
+
+
+def _validate_clickup_task(value: Any) -> str:
+    value = _require_string(value)
+    if value.startswith("https://"):
+        from urllib.parse import urlparse
+        parsed = urlparse(value)
+        if parsed.netloc not in {"app.clickup.com", "clickup.com"}:
+            raise ParameterValidationError("ClickUp URL must use clickup.com")
+        match = re.search(r"/t/([A-Za-z0-9]+)", parsed.path)
+        if not match:
+            raise ParameterValidationError("ClickUp task URL does not contain /t/<task-id>")
+        return match.group(1)
+    if not CLICKUP_TASK_ID_RE.fullmatch(value):
+        raise ParameterValidationError("must be an alphanumeric ClickUp task ID or HTTPS task URL")
+    return value
+
+
+def _validate_positive_int(value: Any, *, minimum: int = 1, maximum: int = 500) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ParameterValidationError("must be an integer")
+    if not minimum <= value <= maximum:
+        raise ParameterValidationError(f"must be between {minimum} and {maximum}")
+    return value
+
+
+def _validate_bool(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ParameterValidationError("must be true or false")
+    return value
+
+
+def _validate_properties(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        raise ParameterValidationError("must be a non-empty object")
+    try:
+        encoded = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ParameterValidationError("must be JSON serializable") from exc
+    if len(encoded.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        raise ParameterValidationError("properties object exceeds the payload limit")
+    return value
+
+
+def _validate_query(value: Any) -> str:
+    value = _require_string(value)
+    if len(value) > 500:
+        raise ParameterValidationError("must be at most 500 characters")
+    return value
+
+
+def _validate_version(value: Any) -> str:
+    value = _require_string(value)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ParameterValidationError("must use YYYY-MM-DD format")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Schema registry
+# ---------------------------------------------------------------------------
+
+SCHEMAS: dict[str, OperationSchema] = {
+    "notion.get_notion_page_content": OperationSchema(
+        "notion.get_notion_page_content", frozenset({"notion_page_id"}),
+        frozenset({"include_blocks"}),
+        {"notion_page_id": _validate_notion_id_or_url, "include_blocks": _validate_bool},
+    ),
+    "notion.list_notion_database_items": OperationSchema(
+        "notion.list_notion_database_items", frozenset({"notion_database_id_or_url"}),
+        frozenset({"limit"}),
+        {"notion_database_id_or_url": _validate_notion_id_or_url, "limit": _validate_positive_int},
+    ),
+    "notion.search_notion_content": OperationSchema(
+        "notion.search_notion_content", frozenset({"notion_version"}),
+        frozenset({"query", "sort_direction", "sort_timestamp", "filter_value", "filter_property", "limit"}),
+        {"notion_version": _validate_version, "query": _validate_query, "limit": _validate_positive_int},
+    ),
+    "notion.update_notion_item_properties": OperationSchema(
+        "notion.update_notion_item_properties", frozenset({"notion_item_id_or_url", "notion_updated_properties"}),
+        frozenset(),
+        {"notion_item_id_or_url": _validate_notion_id_or_url, "notion_updated_properties": _validate_properties},
+        write_operation=True,
+    ),
+    "clickup.get_clickup_task_details": OperationSchema(
+        "clickup.get_clickup_task_details", frozenset({"clickup_task_name_or_id"}),
+        frozenset({"include_subtasks", "include_markdown_description", "custom_fields"}),
+        {"clickup_task_name_or_id": _validate_clickup_task, "include_subtasks": _validate_bool,
+         "include_markdown_description": _validate_bool, "custom_fields": _validate_bool},
+    ),
+    "clickup.search_clickup_tasks": OperationSchema(
+        "clickup.search_clickup_tasks", frozenset({"query", "clickup_workspace_id"}),
+        frozenset({"limit"}),
+        {"query": _validate_query, "clickup_workspace_id": _require_string, "limit": _validate_positive_int},
+    ),
+    "clickup.create_clickup_task": OperationSchema(
+        "clickup.create_clickup_task", frozenset({"name", "clickup_workspace_id"}),
+        frozenset({"description", "status", "priority", "clickup_list_name_or_id", "assignees", "tags", "due_date"}),
+        {"name": _require_string, "clickup_workspace_id": _require_string,
+         "description": _require_string, "status": _require_string,
+         "clickup_list_name_or_id": _require_string},
+        write_operation=True,
+    ),
+    "clickup.create_clickup_task_comment": OperationSchema(
+        "clickup.create_clickup_task_comment", frozenset({"clickup_task_name_or_id", "comment_text", "clickup_workspace_id"}),
+        frozenset({"notify_all", "assignee_clickup_user_name", "list_of_teammate_clickup_user_names"}),
+        {"clickup_task_name_or_id": _validate_clickup_task, "comment_text": _require_string,
+         "clickup_workspace_id": _require_string, "notify_all": _validate_bool,
+         "assignee_clickup_user_name": _require_string},
+        write_operation=True,
+    ),
+}# ---------------------------------------------------------------------------
+# Core functions
+# ---------------------------------------------------------------------------
+
+
+def validate(operation: str, payload: Mapping[str, Any], *, allow_writes: bool = False) -> dict[str, Any]:
+    """Validate and normalize a payload for a supported operation.
+
+    Unknown operations, unexpected keys, missing keys, malformed IDs, and write
+    operations without explicit opt-in fail closed.
+    """
+    if operation not in SCHEMAS:
+        raise ParameterValidationError(f"unsupported operation: {operation}")
+    if not isinstance(payload, Mapping):
+        raise ParameterValidationError("payload must be a JSON object")
+
+    schema = SCHEMAS[operation]
+    if schema.write_operation and not allow_writes:
+        raise ParameterValidationError(
+            f"{operation} is a write operation; pass allow_writes=True after confirming the target"
+        )
+    missing = schema.required - payload.keys()
+    unknown = payload.keys() - schema.allowed
+    if missing:
+        raise ParameterValidationError(f"missing required parameter(s): {', '.join(sorted(missing))}")
+    if unknown:
+        raise ParameterValidationError(f"unexpected parameter(s): {', '.join(sorted(unknown))}")
+
+    normalized: dict[str, Any] = {}
+    for key, value in payload.items():
+        validator = schema.validators.get(key)
+        try:
+            normalized[key] = validator(value) if validator else value
+        except ParameterValidationError as exc:
+            raise ParameterValidationError(f"{key}: {exc}") from exc
+
+    serialized = json.dumps(normalized, separators=(",", ":"), ensure_ascii=False)
+    if len(serialized.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        raise ParameterValidationError("payload exceeds the maximum permitted size")
+    return normalized
+
+
+def build_command(operation: str, payload: Mapping[str, Any], *, allow_writes: bool = False) -> list[str]:
+    """Return a safe argv list suitable for subprocess execution.
+
+    For write operations, the mandatory security pre-check is enforced
+    before the command is assembled.
+    """
+    schema = SCHEMAS.get(operation)
+    if schema and schema.write_operation:
+        _security_precheck(operation, payload)
+        # Budget-Aware: log projected cost before write (v3.0.0)
+        _budget_log_write(operation)
+    normalized = validate(operation, payload, allow_writes=allow_writes)
+    return ["pokee-skill", operation, json.dumps(normalized, separators=(",", ":"), ensure_ascii=False)]
+
+
+def run(operation: str, payload: Mapping[str, Any], *, allow_writes: bool = False, timeout: int = 600) -> subprocess.CompletedProcess[str]:
+    """Validate then invoke pokee-skill without shell interpolation.
+
+    For write operations, the mandatory security pre-check is enforced
+    before the subprocess is spawned.
+    """
+    if timeout < 1 or timeout > 600:
+        raise ParameterValidationError("timeout must be between 1 and 600 seconds")
+    return subprocess.run(
+        build_command(operation, payload, allow_writes=allow_writes),
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _load_json(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ParameterValidationError(f"invalid JSON payload: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise ParameterValidationError("payload must decode to a JSON object")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Validate Notion/ClickUp pokee-skill parameters.")
+    parser.add_argument("mode", choices=("validate", "build", "run"))
+    parser.add_argument("operation", choices=sorted(SCHEMAS))
+    parser.add_argument("payload", help="JSON object containing operation parameters")
+    parser.add_argument("--allow-writes", action="store_true", help="permit an allow-listed write operation")
+    parser.add_argument("--timeout", type=int, default=600, help="run timeout in seconds (1-600)")
+    args = parser.parse_args(argv)
+
+    try:
+        payload = _load_json(args.payload)
+
+        if args.mode == "validate":
+            # Validation is non-mutating. The pre-check is enforced immediately
+            # before command construction for build/run modes.
+            schema = SCHEMAS.get(args.operation)
+            if schema and schema.write_operation:
+                _security_precheck(args.operation, payload)
+                # Budget-Aware: log projected cost for write validation (v3.0.0)
+                _budget_log_write(args.operation)
+            print(json.dumps(validate(args.operation, payload, allow_writes=args.allow_writes), indent=2, ensure_ascii=False))
+            return 0
+        if args.mode == "build":
+            command = build_command(args.operation, payload, allow_writes=args.allow_writes)
+            print(json.dumps(command, ensure_ascii=False))
+            return 0
+        result = run(args.operation, payload, allow_writes=args.allow_writes, timeout=args.timeout)
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+        return result.returncode
+    except SecurityPrecheckError as exc:
+        print(f"security pre-check failed: {exc}", file=sys.stderr)
+        return 3
+    except (ParameterValidationError, subprocess.TimeoutExpired) as exc:
+        print(f"validation error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    # Self-test: validate the module loads and basic validation works
-    print("PokeeHelper.py self-test:")
-
-    # Test valid Notion ID
-    try:
-        validate_notion_id("3ad0c5d3-8d0b-8182-9438-f63737495080")
-        print("  [PASS] Valid Notion ID accepted")
-    except ValueError as e:
-        print(f"  [FAIL] Valid Notion ID rejected: {e}")
-
-    # Test invalid Notion ID
-    try:
-        validate_notion_id("not-a-valid-uuid")
-        print("  [FAIL] Invalid Notion ID accepted")
-    except ValueError:
-        print("  [PASS] Invalid Notion ID rejected")
-
-    # Test valid ClickUp ID
-    try:
-        validate_clickup_id("901411174933")
-        print("  [PASS] Valid ClickUp ID accepted")
-    except ValueError as e:
-        print(f"  [FAIL] Valid ClickUp ID rejected: {e}")
-
-    # Test invalid ClickUp ID
-    try:
-        validate_clickup_id("not-a-number")
-        print("  [FAIL] Invalid ClickUp ID accepted")
-    except ValueError:
-        print("  [PASS] Invalid ClickUp ID rejected")
-
-    # Test title validation
-    try:
-        _validate_title("")
-        print("  [FAIL] Empty title accepted")
-    except ValueError:
-        print("  [PASS] Empty title rejected")
-
-    print("Self-test complete.")
+    raise SystemExit(main())
