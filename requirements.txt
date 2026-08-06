@@ -1,0 +1,4 @@
+# Runtime dependency baseline for pokeeapilib.
+# Reviewed: 2026-08-06
+# This project currently imports only the Python standard library at runtime.
+# Packaging/build backend dependency is intentionally tracked separately in pyproject.toml.

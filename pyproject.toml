@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pokeeapilib"
+version = "0.1.914.dev2"
+description = "Pokee API Library"
+requires-python = ">=3.11"
+dependencies = []
